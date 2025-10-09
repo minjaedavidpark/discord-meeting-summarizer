@@ -19,7 +19,7 @@ rm -f bot.log nohup.out bot.pid
 
 echo "🚀 Starting bot..."
 source venv/bin/activate
-python bot.py > bot.log 2>&1 &
+nohup python bot.py > bot.log 2>&1 &
 BOT_PID=$!
 
 # Save PID to file for easy stopping later
