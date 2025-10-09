@@ -1,0 +1,27 @@
+# Fly.io deployment configuration
+# Deploy with: flyctl deploy
+
+app = "discord-meeting-summarizer"
+primary_region = "iad"
+
+[build]
+
+[env]
+  TZ = "America/New_York"
+
+[[mounts]]
+  source = "recordings_data"
+  destination = "/app/recordings"
+
+[http_service]
+  internal_port = 8080
+  force_https = false
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
+
