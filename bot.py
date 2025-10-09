@@ -314,6 +314,18 @@ async def process_audio_file(ctx, processing_msg, audio_filename: str, timestamp
                     await ctx.send(f"📊 **Meeting Summary**\n```\n{part}\n```")
                 else:
                     await ctx.send(f"```\n{part}\n```")
+
+            # Post summary to forum channel 'daily-meeting-logs'
+            try:
+                guild = getattr(ctx, 'guild', None) or getattr(getattr(ctx, 'channel', None), 'guild', None)
+                if guild is not None:
+                    today_title = datetime.now().strftime('%Y-%m-%d %H:%M')
+                    await post_summary_to_forum(guild, forum_name='daily-meeting-logs', title=today_title, summary_text=summary)
+                    logger.info("Posted summary to forum 'daily-meeting-logs'")
+                else:
+                    logger.warning("Could not resolve guild from context for forum posting")
+            except Exception as e:
+                logger.error(f"Failed to post summary to forum: {e}", exc_info=True)
             
             logger.info(f"Meeting processed successfully: {timestamp}")
         else:
@@ -474,6 +486,29 @@ def split_message(text: str, max_length: int = 1900) -> list[str]:
     
     return parts
 
+
+async def post_summary_to_forum(guild: discord.Guild, forum_name: str, title: str, summary_text: str):
+    """Create a new post in the specified forum with the given title and summary text.
+
+    If the summary exceeds the message limit, the first chunk is used as the
+    initial post content and remaining chunks are replied in the created thread.
+    """
+    # Find forum channel by name
+    forum_channel = discord.utils.get(guild.channels, name=forum_name)
+    if forum_channel is None or not isinstance(forum_channel, discord.ForumChannel):
+        raise RuntimeError(f"Forum channel '{forum_name}' not found or is not a ForumChannel")
+
+    parts = split_message(summary_text, 1900)
+    first_content = parts[0]
+
+    # Create the thread with the first part as the initial message
+    created = await forum_channel.create_thread(name=title, content=first_content)
+    thread = created.thread if hasattr(created, 'thread') else created
+
+    # Post remaining parts as follow-up messages in the thread
+    if len(parts) > 1:
+        for part in parts[1:]:
+            await thread.send(part)
 
 def main():
     """Main entry point"""

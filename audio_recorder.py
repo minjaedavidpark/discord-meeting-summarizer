@@ -18,7 +18,7 @@ class MeetingRecorder(voice_recv.AudioSink):
         self.audio_data: Dict[int, bytearray] = {}
         self.user_names: Dict[int, str] = {}
         self.sample_rate = 48000  # Discord's sample rate
-        self.channels = 2  # Stereo
+        self.channels = 2  # Discord sends stereo (we convert to mono when saving)
         self.sample_width = 2  # 16-bit audio
         logger.info("MeetingRecorder initialized")
     
@@ -61,23 +61,31 @@ class MeetingRecorder(voice_recv.AudioSink):
             
             max_length = max(len(data) for data in non_empty_data)
             
-            # Mix all audio streams
-            # Each sample is 2 bytes (16-bit), so divide by 2 for sample count
-            sample_count = max_length // 2
-            mixed_samples = [0] * sample_count
+            # Discord sends STEREO PCM data (2 channels interleaved)
+            # Each frame is 4 bytes: 2 bytes for left channel, 2 bytes for right channel
+            # We need to convert stereo to mono by averaging the channels
+            
+            # Calculate mono sample count (stereo has twice as many samples)
+            mono_sample_count = max_length // 4  # 4 bytes per stereo frame
+            mixed_samples = [0] * mono_sample_count
             
             # Mix all user audio
             user_count = len(self.audio_data)
             for user_id, audio_bytes in self.audio_data.items():
-                # Convert bytes to samples (16-bit signed integers)
+                # Process stereo PCM data
                 sample_index = 0
-                for i in range(0, len(audio_bytes), 2):
-                    if i + 1 < len(audio_bytes):
-                        # Unpack 16-bit signed integer (little-endian)
-                        sample = struct.unpack('<h', audio_bytes[i:i+2])[0]
-                        if sample_index < sample_count:
-                            # Add to mix (we'll normalize later)
-                            mixed_samples[sample_index] += sample
+                for i in range(0, len(audio_bytes), 4):  # 4 bytes per stereo frame
+                    if i + 3 < len(audio_bytes):
+                        # Unpack stereo frame (left and right channels)
+                        left = struct.unpack('<h', audio_bytes[i:i+2])[0]
+                        right = struct.unpack('<h', audio_bytes[i+2:i+4])[0]
+                        
+                        # Convert stereo to mono by averaging
+                        mono_sample = (left + right) // 2
+                        
+                        if sample_index < mono_sample_count:
+                            # Add to mix
+                            mixed_samples[sample_index] += mono_sample
                             sample_index += 1
             
             # Normalize mixed audio to prevent clipping
@@ -94,7 +102,7 @@ class MeetingRecorder(voice_recv.AudioSink):
             
             # Save as WAV file
             with wave.open(filename, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # Mono (already mixed)
+                wav_file.setnchannels(1)  # Mono (converted from stereo)
                 wav_file.setsampwidth(self.sample_width)
                 wav_file.setframerate(self.sample_rate)
                 wav_file.writeframes(bytes(mixed_bytes))
