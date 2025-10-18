@@ -59,6 +59,8 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 is_recording = False
 current_recorder: Optional[MeetingRecorder] = None
 recording_channel = None
+recording_watchdog_task: Optional[asyncio.Task] = None
+last_checkpoint_data: Optional[bytes] = None
 
 
 @bot.event
@@ -71,6 +73,108 @@ async def on_ready():
     if meeting_time:
         scheduled_recording.start()
         logger.info(f'Scheduled recording enabled for {meeting_time}')
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Handle voice state updates including reconnections"""
+    global current_recorder, is_recording
+    
+    # Log if it's the bot itself
+    if member == bot.user:
+        if before.channel != after.channel:
+            if after.channel is None:
+                logger.warning("Bot was disconnected from voice channel")
+                # If we're recording, log a warning but don't stop (reconnection may happen)
+                if is_recording and current_recorder:
+                    logger.warning("Voice disconnection during recording - waiting for reconnection...")
+            elif before.channel is None:
+                logger.info(f"Bot connected to voice channel: {after.channel.name}")
+            else:
+                logger.info(f"Bot moved from {before.channel.name} to {after.channel.name}")
+
+
+async def recording_watchdog():
+    """Monitor the recording and detect issues"""
+    global is_recording, current_recorder, recording_channel, last_checkpoint_data
+    
+    checkpoint_interval = 60  # Save checkpoint every 60 seconds
+    last_checkpoint_time = datetime.now()
+    silence_warning_sent = False
+    
+    try:
+        while is_recording:
+            await asyncio.sleep(10)  # Check every 10 seconds
+            
+            if not current_recorder:
+                break
+            
+            status = current_recorder.get_status()
+            seconds_since_audio = status['last_audio_seconds_ago']
+            
+            # Create periodic checkpoints
+            if (datetime.now() - last_checkpoint_time).total_seconds() > checkpoint_interval:
+                if status['has_data']:
+                    logger.info("Creating periodic checkpoint...")
+                    # Run checkpoint creation in executor to avoid blocking event loop
+                    loop = asyncio.get_event_loop()
+                    last_checkpoint_data = await loop.run_in_executor(
+                        None, 
+                        current_recorder.create_checkpoint
+                    )
+                    if last_checkpoint_data:
+                        logger.info(f"Checkpoint created: {len(last_checkpoint_data)} bytes")
+                        # Optionally save checkpoint to disk (also in executor to avoid blocking)
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        checkpoint_path = f"recordings/checkpoint_{timestamp}.wav"
+                        
+                        def save_checkpoint():
+                            with open(checkpoint_path, 'wb') as f:
+                                f.write(last_checkpoint_data)
+                        
+                        await loop.run_in_executor(None, save_checkpoint)
+                        logger.info(f"Checkpoint saved to {checkpoint_path}")
+                last_checkpoint_time = datetime.now()
+            
+            # Warn if no audio has been received for a while
+            if seconds_since_audio > 60 and not silence_warning_sent and status['total_bytes'] > 0:
+                logger.warning(f"⚠️ No audio received for {seconds_since_audio:.0f} seconds")
+                if recording_channel:
+                    try:
+                        # Check if recorder is stopped (shouldn't happen now with the fix)
+                        if current_recorder.is_stopped:
+                            await recording_channel.send(
+                                f"⚠️ **Critical**: Recorder was stopped unexpectedly after {seconds_since_audio:.0f}s of silence. "
+                                f"This is a bug. Please use `!stop` to save what we have."
+                            )
+                        else:
+                            await recording_channel.send(
+                                f"⚠️ **Warning**: No audio received for {seconds_since_audio:.0f} seconds. "
+                                f"This could be due to:\n"
+                                f"• Everyone is muted or silent\n"
+                                f"• Network issues (bot will auto-recover)\n"
+                                f"• Recording will continue when audio resumes"
+                            )
+                        silence_warning_sent = True
+                    except Exception as e:
+                        logger.error(f"Failed to send warning message: {e}")
+            
+            # Reset warning flag if audio resumes
+            if seconds_since_audio < 30 and silence_warning_sent:
+                logger.info("Audio reception resumed")
+                if recording_channel:
+                    try:
+                        await recording_channel.send("✅ Audio reception resumed! Recording continues...")
+                    except Exception as e:
+                        logger.error(f"Failed to send resume message: {e}")
+                silence_warning_sent = False
+            
+            logger.debug(f"Watchdog check: {status}")
+    
+    except asyncio.CancelledError:
+        logger.info("Recording watchdog cancelled")
+    except Exception as e:
+        logger.error(f"Error in recording watchdog: {e}", exc_info=True)
 
 
 @bot.event
@@ -164,7 +268,7 @@ async def on_message(message):
 @bot.command(name='join', help='Join voice channel and start recording')
 async def join(ctx):
     """Join the voice channel and start recording"""
-    global is_recording, current_recorder, recording_channel
+    global is_recording, current_recorder, recording_channel, recording_watchdog_task, last_checkpoint_data
     
     if not ctx.author.voice:
         await ctx.send("❌ You need to be in a voice channel first!")
@@ -194,8 +298,13 @@ async def join(ctx):
         voice_client.listen(current_recorder)
         
         is_recording = True
+        last_checkpoint_data = None
         
-        await ctx.send(f"🔴 **Recording started** in {channel.name}!\n💡 Use `!stop` when done to get your summary.")
+        # Start watchdog task
+        recording_watchdog_task = asyncio.create_task(recording_watchdog())
+        logger.info("Started recording watchdog")
+        
+        await ctx.send(f"🔴 **Recording started** in {channel.name}!\n💡 Use `!stop` when done to get your summary.\n🔒 Auto-save checkpoints enabled every 60 seconds.")
         logger.info(f"Started recording in {channel.name}")
         
     except Exception as e:
@@ -206,7 +315,7 @@ async def join(ctx):
 @bot.command(name='stop', help='Stop recording and generate summary')
 async def stop(ctx):
     """Stop recording and process the audio"""
-    global is_recording, current_recorder, recording_channel
+    global is_recording, current_recorder, recording_channel, recording_watchdog_task, last_checkpoint_data
     
     if not is_recording:
         await ctx.send("❌ Not currently recording! Use `!join` to start.")
@@ -220,36 +329,67 @@ async def stop(ctx):
     processing_msg = await ctx.send("⏹️ Stopping recording and processing...")
     
     try:
+        # Stop the watchdog first
+        if recording_watchdog_task:
+            recording_watchdog_task.cancel()
+            try:
+                await recording_watchdog_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Recording watchdog stopped")
+        
         # Save the recording BEFORE stopping (stop_listening clears the data)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         audio_filename = f"recordings/meeting_{timestamp}.wav"
         
-        if current_recorder and current_recorder.audio_data:
-            success = current_recorder.save_to_file(audio_filename)
+        if current_recorder:
+            status = current_recorder.get_status()
+            logger.info(f"Recorder status at stop: {status}")
             
-            # Now stop listening
-            ctx.voice_client.stop_listening()
-            is_recording = False
-            
-            if success:
-                logger.info(f"Saved recording to {audio_filename}")
-                await processing_msg.edit(content="🎙️ Recording saved! Transcribing...")
+            if status['has_data']:
+                success = current_recorder.save_to_file(audio_filename)
                 
-                # Process the audio
-                await process_audio_file(ctx, processing_msg, audio_filename, timestamp)
+                # Now stop listening
+                ctx.voice_client.stop_listening()
+                is_recording = False
+                
+                if success:
+                    logger.info(f"Saved recording to {audio_filename}")
+                    await processing_msg.edit(content="🎙️ Recording saved! Transcribing...")
+                    
+                    # Process the audio
+                    await process_audio_file(ctx, processing_msg, audio_filename, timestamp)
+                else:
+                    await processing_msg.edit(content="❌ Failed to save recording!")
             else:
-                await processing_msg.edit(content="❌ Failed to save recording!")
+                # No data in current recorder - check if we have checkpoint data
+                ctx.voice_client.stop_listening()
+                is_recording = False
+                
+                if last_checkpoint_data and len(last_checkpoint_data) > 0:
+                    # Save checkpoint data instead
+                    logger.warning(f"No current audio data, but checkpoint available ({len(last_checkpoint_data)} bytes)")
+                    with open(audio_filename, 'wb') as f:
+                        f.write(last_checkpoint_data)
+                    
+                    await processing_msg.edit(content="⚠️ Used backup checkpoint data. Recording may have been interrupted. Processing...")
+                    await process_audio_file(ctx, processing_msg, audio_filename, timestamp)
+                else:
+                    await processing_msg.edit(content="❌ No audio data recorded! Make sure people spoke during the meeting.\n💡 This can happen if Discord's audio packets fail to decode.")
+                    logger.warning("No audio data in recorder and no checkpoint available")
         else:
-            # Stop listening even if no data
+            # Stop listening even if no recorder
             ctx.voice_client.stop_listening()
             is_recording = False
             await processing_msg.edit(content="❌ No audio data recorded! Make sure people spoke during the meeting.")
-            logger.warning("No audio data in recorder")
+            logger.warning("No current recorder")
         
         # Cleanup
         if current_recorder:
+            current_recorder.stop()  # Explicitly stop the recorder
             current_recorder.cleanup()
         current_recorder = None
+        last_checkpoint_data = None
         
         # Disconnect from voice channel
         if ctx.voice_client:
@@ -261,6 +401,7 @@ async def stop(ctx):
         await processing_msg.edit(content=f"❌ Error processing recording: {str(e)}")
         is_recording = False
         current_recorder = None
+        last_checkpoint_data = None
         # Try to disconnect even on error
         if ctx.voice_client:
             await ctx.voice_client.disconnect()
@@ -269,7 +410,7 @@ async def stop(ctx):
 @bot.command(name='leave', help='Leave the voice channel')
 async def leave(ctx):
     """Disconnect from the voice channel"""
-    global is_recording, current_recorder
+    global is_recording, current_recorder, recording_watchdog_task
     
     if ctx.voice_client is None:
         await ctx.send("❌ I'm not in a voice channel!")
@@ -279,17 +420,85 @@ async def leave(ctx):
         await ctx.send("⚠️ Recording in progress! Use `!stop` first to save the recording.")
         return
     
+    # Stop watchdog if running
+    if recording_watchdog_task:
+        recording_watchdog_task.cancel()
+        try:
+            await recording_watchdog_task
+        except asyncio.CancelledError:
+            pass
+    
     await ctx.voice_client.disconnect()
     await ctx.send("✅ Disconnected from voice channel")
+
+
+@bot.command(name='status', help='Check recording status')
+async def status(ctx):
+    """Check the current recording status"""
+    global is_recording, current_recorder
+    
+    if not is_recording:
+        await ctx.send("❌ Not currently recording. Use `!join` to start.")
+        return
+    
+    if not current_recorder:
+        await ctx.send("⚠️ Recording flag is set but no recorder found. Something may be wrong.")
+        return
+    
+    status = current_recorder.get_status()
+    
+    # Format status message
+    users_str = f"{status['users_recording']} user(s)"
+    bytes_str = f"{status['total_bytes'] / 1024 / 1024:.2f} MB"
+    
+    # Use actual recording duration (wall clock time)
+    recording_minutes = int(status['recording_duration'] // 60)
+    recording_seconds = int(status['recording_duration'] % 60)
+    duration_str = f"{recording_minutes}m {recording_seconds}s"
+    
+    # Also show estimated duration from audio data for comparison
+    estimated_minutes = int(status['estimated_duration'] // 60)
+    estimated_seconds = int(status['estimated_duration'] % 60)
+    estimated_str = f"{estimated_minutes}m {estimated_seconds}s"
+    
+    last_audio_str = f"{status['last_audio_seconds_ago']:.0f} seconds ago"
+    
+    status_emoji = "🟢" if status['last_audio_seconds_ago'] < 30 else "🟡" if status['last_audio_seconds_ago'] < 60 else "🔴"
+    
+    message = f"""
+{status_emoji} **Recording Status**
+👥 Users: {users_str}
+💾 Data: {bytes_str}
+⏱️ Real time: {duration_str}
+🎵 Audio duration: {estimated_str}
+📡 Last audio: {last_audio_str}
+✅ Has data: {'Yes' if status['has_data'] else 'No'}
+"""
+    
+    if status['last_audio_seconds_ago'] > 60:
+        message += "\n⚠️ **Warning**: No recent audio! Recording may have stopped."
+    
+    await ctx.send(message)
 
 
 async def process_audio_file(ctx, processing_msg, audio_filename: str, timestamp: str):
     """Helper function to process an audio file"""
     try:
-        # Transcribe the audio
-        transcript = await transcribe_audio(audio_filename)
+        # Create progress callback to update the user
+        async def update_progress(current: int, total: int, status: str):
+            """Update the Discord message with transcription progress"""
+            try:
+                progress_bar = "▓" * current + "░" * (total - current)
+                await processing_msg.edit(
+                    content=f"🎙️ Transcribing... [{progress_bar}] {current}/{total} chunks\n{status}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update progress: {e}")
         
-        if transcript:
+        # Transcribe the audio with progress updates
+        transcript = await transcribe_audio(audio_filename, progress_callback=update_progress)
+        
+        if transcript and transcript.strip():
             transcript_filename = f"recordings/transcript_{timestamp}.txt"
             with open(transcript_filename, 'w', encoding='utf-8') as f:
                 f.write(transcript)
@@ -299,42 +508,46 @@ async def process_audio_file(ctx, processing_msg, audio_filename: str, timestamp
             # Generate summary
             summary = await summarize_transcript(transcript)
             
-            # Save summary
-            summary_filename = f"recordings/summary_{timestamp}.txt"
-            with open(summary_filename, 'w', encoding='utf-8') as f:
-                f.write(summary)
-            
-            # Send summary to Discord (split if too long)
-            await processing_msg.edit(content="✅ Processing complete!")
-            
-            # Send summary in chunks if needed
-            summary_parts = split_message(summary, 1900)
-            for i, part in enumerate(summary_parts):
-                if i == 0:
-                    await ctx.send(f"📊 **Meeting Summary**\n```\n{part}\n```")
-                else:
-                    await ctx.send(f"```\n{part}\n```")
+            if summary and summary.strip():
+                # Save summary
+                summary_filename = f"recordings/summary_{timestamp}.txt"
+                with open(summary_filename, 'w', encoding='utf-8') as f:
+                    f.write(summary)
+                
+                # Send summary to Discord (split if too long)
+                await processing_msg.edit(content="✅ Processing complete!")
+                
+                # Send summary in chunks if needed
+                summary_parts = split_message(summary, 1900)
+                for i, part in enumerate(summary_parts):
+                    if i == 0:
+                        await ctx.send(f"📊 **Meeting Summary**\n```\n{part}\n```")
+                    else:
+                        await ctx.send(f"```\n{part}\n```")
 
-            # Post summary to forum channel 'daily-meeting-logs'
-            try:
-                guild = getattr(ctx, 'guild', None) or getattr(getattr(ctx, 'channel', None), 'guild', None)
-                if guild is not None:
-                    today_title = datetime.now().strftime('%Y-%m-%d %H:%M')
-                    await post_summary_to_forum(guild, forum_name='daily-meeting-logs', title=today_title, summary_text=summary)
-                    logger.info("Posted summary to forum 'daily-meeting-logs'")
-                else:
-                    logger.warning("Could not resolve guild from context for forum posting")
-            except Exception as e:
-                logger.error(f"Failed to post summary to forum: {e}", exc_info=True)
-            
-            logger.info(f"Meeting processed successfully: {timestamp}")
+                # Post summary to forum channel 'daily-meeting-logs'
+                try:
+                    guild = getattr(ctx, 'guild', None) or getattr(getattr(ctx, 'channel', None), 'guild', None)
+                    if guild is not None:
+                        today_title = datetime.now().strftime('%Y-%m-%d %H:%M')
+                        await post_summary_to_forum(guild, forum_name='daily-meeting-logs', title=today_title, summary_text=summary)
+                        logger.info("Posted summary to forum 'daily-meeting-logs'")
+                    else:
+                        logger.warning("Could not resolve guild from context for forum posting")
+                except Exception as e:
+                    logger.error(f"Failed to post summary to forum: {e}", exc_info=True)
+                
+                logger.info(f"Meeting processed successfully: {timestamp}")
+            else:
+                await processing_msg.edit(content="❌ Summary generation failed!")
+                logger.error("Summary generation returned empty")
         else:
-            await processing_msg.edit(content="❌ Transcription failed!")
-            logger.error("Transcription returned empty")
+            await processing_msg.edit(content="❌ Transcription failed! The audio file may be corrupted or no speech was detected.")
+            logger.error("Transcription returned empty or failed")
             
     except Exception as e:
         logger.error(f"Error processing audio: {e}", exc_info=True)
-        await processing_msg.edit(content=f"❌ Error: {str(e)}")
+        await processing_msg.edit(content=f"❌ Error during processing: {str(e)}\nCheck logs for details.")
 
 
 @bot.command(name='upload', help='Upload and process a meeting recording')
