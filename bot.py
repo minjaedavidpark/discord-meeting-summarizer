@@ -747,9 +747,10 @@ def main():
         # Run the bot and web server together
         async def run_bot_and_server():
             await runner.setup()
-            site = web.TCPSite(runner, '0.0.0.0', 8080)
+            port = int(os.getenv('PORT', 8080))
+            site = web.TCPSite(runner, '0.0.0.0', port)
             await site.start()
-            logger.info("Web server started on port 8080")
+            logger.info(f"Web server started on port {port}")
             
             async with bot:
                 await bot.start(token)
