@@ -734,7 +734,28 @@ def main():
         return
     
     try:
-        bot.run(token)
+        # Start the web server for health checks
+        from aiohttp import web
+        
+        async def health_check(request):
+            return web.Response(text="OK")
+            
+        app = web.Application()
+        app.router.add_get('/', health_check)
+        runner = web.AppRunner(app)
+        
+        # Run the bot and web server together
+        async def run_bot_and_server():
+            await runner.setup()
+            site = web.TCPSite(runner, '0.0.0.0', 8080)
+            await site.start()
+            logger.info("Web server started on port 8080")
+            
+            async with bot:
+                await bot.start(token)
+        
+        asyncio.run(run_bot_and_server())
+        
     except Exception as e:
         logger.error(f"Failed to start bot: {e}", exc_info=True)
 

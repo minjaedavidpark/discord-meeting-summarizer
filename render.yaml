@@ -1,11 +1,10 @@
 # Render.com deployment configuration
-# Deploy by connecting your GitHub repo to Render
-
 services:
-  - type: worker
+  - type: web
     name: discord-meeting-bot
     env: docker
-    plan: starter
+    plan: free
+    startCommand: python bot.py
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false
@@ -19,8 +18,3 @@ services:
         value: "09:00"
       - key: MEETING_TIMEZONE
         value: "America/New_York"
-    disk:
-      name: recordings
-      mountPath: /app/recordings
-      sizeGB: 1
-
