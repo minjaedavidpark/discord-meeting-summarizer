@@ -207,7 +207,7 @@ docker-compose up -d
 - Use environment variables for secrets
 - Limit bot permissions to necessary channels only
 - Regularly review recordings and delete old ones
-
+   
 ## 💡 Tips & Tricks
 
 - **Cost Optimization**: Whisper API costs ~$0.006 per minute. A 30-min meeting costs about $0.18
