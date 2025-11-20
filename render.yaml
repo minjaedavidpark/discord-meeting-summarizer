@@ -10,11 +10,5 @@ services:
         sync: false
       - key: DISCORD_GUILD_ID
         sync: false
-      - key: DISCORD_VOICE_CHANNEL_ID
-        sync: false
       - key: OPENAI_API_KEY
         sync: false
-      - key: MEETING_TIME
-        value: "09:00"
-      - key: MEETING_TIMEZONE
-        value: "America/New_York"
